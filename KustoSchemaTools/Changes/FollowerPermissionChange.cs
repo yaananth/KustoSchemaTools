@@ -32,14 +32,19 @@ namespace KustoSchemaTools.Changes
                 .Select(a => "\"" + a.Id + "\""
                 );
 
+            var hasPrincipals = ids.Any();
+
             // Kusto control commands expect the literal keyword 'none' when no principals
             // are supplied. Wrapping none in parentheses makes it a principal named "none"
             // and the command is rejected, so only use parentheses for non-empty sets.
-            var idsFragment = ids.Any() ? $"({string.Join(",", ids)})" : "none";
+            var idsFragment = hasPrincipals ? $"({string.Join(",", ids)})" : "none";
 
-            // Leader name is optional; when provided we append it the same way the
-            // portal does (e.g. '.add follower database DB viewers (...) "leader"').
-            var leaderSuffix = string.IsNullOrWhiteSpace(leaderName) ? string.Empty : $" '{leaderName}'";
+            // Leader name is only relevant when principals are supplied; Kusto rejects
+            // bare leader suffixes following 'none', and they add noise to diffs. Emit
+            // the leader only when we have principals to set.
+            var leaderSuffix = hasPrincipals && !string.IsNullOrWhiteSpace(leaderName)
+                ? $" '{leaderName}'"
+                : string.Empty;
 
             return $".set follower database {Db.BracketIfIdentifier()} {Entity.ToLower()} {idsFragment}{leaderSuffix}";
         }
