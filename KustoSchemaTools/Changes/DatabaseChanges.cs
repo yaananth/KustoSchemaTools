@@ -217,21 +217,25 @@ namespace KustoSchemaTools.Changes
 
         public static List<IChange> GenerateFollowerChanges(FollowerDatabase oldState, FollowerDatabase newState, ILogger log)
         {
-            List<IChange> result =
-            [
-                .. GenerateFollowerCachingChanges(oldState, newState, db => db.Tables, "Table", "table"),
-                .. GenerateFollowerCachingChanges(oldState, newState, db => db.MaterializedViews, "MV", "materialized-view"),
+            var result = new List<IChange>();
 
-            ];
-
+            // Ensure principals-modification-kind is applied before any permission updates
+            // by adding it first (earlier in the ordered script list).
             if (oldState.Permissions.ModificationKind != newState.Permissions.ModificationKind)
             {
                 var kind = newState.Permissions.ModificationKind.ToString().ToLower();
                 result.Add(new BasicChange("FollowerDatabase", "PermissionsModificationKind", $" Change Permission-Modification-Kind from {oldState.Permissions.ModificationKind} to {newState.Permissions.ModificationKind}", new List<DatabaseScriptContainer>
                 {
-                    new DatabaseScriptContainer(new DatabaseScript($".alter follower database {newState.DatabaseName.BracketIfIdentifier()} principals-modification-kind = {kind}", 0), "FollowerChangePolicyModificationKind")
+                    new DatabaseScriptContainer(new DatabaseScript($".alter follower database {newState.DatabaseName.BracketIfIdentifier()} principals-modification-kind = {kind}", -10), "FollowerChangePolicyModificationKind")
                 }));
             }
+
+            result.AddRange(GenerateFollowerCachingChanges(oldState, newState, db => db.Tables, "Table", "table"));
+            result.AddRange(GenerateFollowerCachingChanges(oldState, newState, db => db.MaterializedViews, "MV", "materialized-view"));
+
+            // Permission changes (order defaults to 0) now follow the modification-kind change above.
+            result.AddRange(GenerateFollowerPermissionChanges(oldState, newState, log));
+
             if (oldState.Cache.ModificationKind != newState.Cache.ModificationKind)
             {
                 var kind = newState.Cache.ModificationKind.ToString().ToLower();
@@ -331,6 +335,26 @@ namespace KustoSchemaTools.Changes
             }
 
             return result;
+        }
+
+        private static IEnumerable<IChange> GenerateFollowerPermissionChanges(FollowerDatabase oldState, FollowerDatabase newState, ILogger log)
+        {
+            var changes = new List<IChange>();
+
+            var permissionChanges = new List<IChange>
+            {
+                new FollowerPermissionChange(newState.DatabaseName, "Admins", oldState.Permissions.Admins, newState.Permissions.Admins, newState.Permissions.LeaderName, oldState.Permissions.LeaderName),
+                new FollowerPermissionChange(newState.DatabaseName, "Viewers", oldState.Permissions.Viewers, newState.Permissions.Viewers, newState.Permissions.LeaderName, oldState.Permissions.LeaderName)
+            }.Where(itm => itm.Scripts.Any()).ToList();
+
+            if (permissionChanges.Any())
+            {
+                log.LogInformation($"Detected {permissionChanges.Count} follower permission changes");
+                permissionChanges.Insert(0, new Heading("Permissions (Follower)"));
+            }
+
+            changes.AddRange(permissionChanges);
+            return changes;
         }
     }
 

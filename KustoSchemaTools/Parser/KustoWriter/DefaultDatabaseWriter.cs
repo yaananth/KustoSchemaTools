@@ -12,7 +12,61 @@ namespace KustoSchemaTools.Parser.KustoWriter
     {
         public async Task WriteAsync(Database sourceDb, Database targetDb, KustoClient client, ILogger logger)
         {
-            var changes = DatabaseChanges.GenerateChanges(targetDb, sourceDb, targetDb.Name, logger);
+            // If the target DB is actually a follower (e.g., Data Share), use follower-safe commands
+            var followerMeta = FollowerLoader.LoadFollower(targetDb.Name, client);
+            var isFollower = followerMeta.Permissions.ModificationKind != FollowerModificationKind.None
+                             || followerMeta.Cache.ModificationKind != FollowerModificationKind.None
+                             || !string.IsNullOrWhiteSpace(followerMeta.LeaderClusterMetadataPath);
+
+            List<IChange> changes;
+            if (isFollower)
+            {
+                // Build desired follower state from YAML (permissions and cache) instead of cloning server state,
+                // so cache changes are not dropped.
+                var desiredFollower = new FollowerDatabase
+                {
+                    DatabaseName = targetDb.Name,
+                    Permissions = new FollowerPermissions
+                    {
+                        ModificationKind = followerMeta.Permissions.ModificationKind,
+                        Admins = sourceDb.Admins,
+                        Viewers = sourceDb.Viewers,
+                        LeaderName = followerMeta.Permissions.LeaderName
+                    },
+                    Cache = new FollowerCache
+                    {
+                        ModificationKind = followerMeta.Cache.ModificationKind,
+                        DefaultHotCache = sourceDb.DefaultRetentionAndCache?.HotCache,
+                        Tables = new Dictionary<string, string>(),
+                        MaterializedViews = new Dictionary<string, string>()
+                    }
+                };
+
+                // Populate desired cache only from YAML (allows deletions when entries are absent in YAML)
+                foreach (var tbl in sourceDb.Tables)
+                {
+                    var hot = tbl.Value.Policies?.HotCache;
+                    if (!string.IsNullOrWhiteSpace(hot))
+                    {
+                        desiredFollower.Cache.Tables[tbl.Key] = hot!;
+                    }
+                }
+                foreach (var mv in sourceDb.MaterializedViews)
+                {
+                    var hot = mv.Value.Policies?.HotCache;
+                    if (!string.IsNullOrWhiteSpace(hot))
+                    {
+                        desiredFollower.Cache.MaterializedViews[mv.Key] = hot!;
+                    }
+                }
+
+                changes = DatabaseChanges.GenerateFollowerChanges(followerMeta, desiredFollower, logger);
+            }
+            else
+            {
+                changes = DatabaseChanges.GenerateChanges(targetDb, sourceDb, targetDb.Name, logger);
+            }
+
             var results = await ApplyChangesToDatabase(targetDb.Name, changes, client, logger);
 
             foreach (var result in results)
@@ -25,6 +79,10 @@ namespace KustoSchemaTools.Parser.KustoWriter
             {
                 var followerClient = new KustoClient(follower.Key);
                 var source = FollowerLoader.LoadFollower(follower.Value.DatabaseName, followerClient);
+
+                // Preserve leader metadata so follower permission diffs stay idempotent and include required leader when present.
+                follower.Value.Permissions.LeaderName ??= source.Permissions.LeaderName;
+                follower.Value.LeaderClusterMetadataPath ??= source.LeaderClusterMetadataPath;
 
                 var followerChanges = DatabaseChanges.GenerateFollowerChanges(source, follower.Value, logger);
 
@@ -62,7 +120,6 @@ namespace KustoSchemaTools.Parser.KustoWriter
         {
             var scripts = changes
                 .SelectMany(itm => itm.Scripts)
-                .Where(itm => itm.Order >= 0)
                 .Where(itm => itm.IsValid == true)
                 .OrderBy(itm => itm.Order)
                 .ToList();
